@@ -33,7 +33,7 @@ llm = ChatOpenAI(
 embedding_model = OpenAIEmbeddings(
     openai_api_base="https://genailab.tcs.in",
     model="azure/genailab-maas-text-embedding-3-large",
-    api_key="sk-eSZtXTNitDmAGrD7Ct4liQ",
+    api_key="sk-key",
     http_client=client
 )
 
