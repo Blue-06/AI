@@ -26,7 +26,7 @@ client = httpx.Client(verify=False)
 llm = ChatOpenAI(
     openai_api_base="https://genailab.tcs.in",
     model="azure_ai/genailab-maas-DeepSeek-V3-0324",
-    api_key="sk-eSZtXTNitDmAGrD7Ct4liQ",
+    api_key="sk-nope",
     http_client=client
 )
 
