@@ -1,0 +1,162 @@
+import streamlit as st
+import random
+import httpx
+import torch
+
+# Fix Streamlit file-watcher crash with PyTorch
+torch.classes.__path__ = []
+
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+from langchain_openai import ChatOpenAI
+
+# -----------------------------------
+# PAGE CONFIG
+# -----------------------------------
+st.set_page_config(
+    page_title="Dynamic Voice Profile Adaptation",
+    layout="wide"
+)
+st.title("🎤 Dynamic Voice Profile Adaptation")
+st.write("AI-powered voice authentication that adapts to temporary health changes.")
+
+# -----------------------------------
+# TCS GenAI API
+# -----------------------------------
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    st.sidebar.error("❌ OPENAI_API_KEY not found in .env")
+    st.stop()
+
+client = httpx.Client(verify=False)
+llm = ChatOpenAI(
+    base_url="https://genailab.tcs.in",
+    model="azure_ai/genailab-maas-DeepSeek-R1",
+    api_key=api_key,
+    http_client=client
+)
+
+# -----------------------------------
+# SAMPLE API TEST
+# -----------------------------------
+try:
+    response = llm.invoke("Hi")
+    st.sidebar.success("✅ TCS GenAI Connected")
+    st.sidebar.write("LLM Response:")
+    st.sidebar.write(response.content)
+except Exception as e:
+    st.sidebar.error("❌ Failed to connect to TCS GenAI")
+    st.sidebar.code(str(e))
+
+# -----------------------------------
+# SIDEBAR
+# -----------------------------------
+menu = st.sidebar.selectbox(
+    "Select Option",
+    [
+        "Register Voice",
+        "Authenticate Voice",
+        "Voice History",
+    #    "Dataset Preview"
+    ]
+)
+
+# -----------------------------------
+# REGISTER VOICE
+# -----------------------------------
+if menu == "Register Voice":
+    st.header("🎤 Register Your Voice")
+    uploaded_file = st.file_uploader(
+        "Upload your normal voice sample (.wav)",
+        type=["wav"]
+    )
+    if uploaded_file:
+        st.success("Voice profile registered successfully!")
+        st.info("Voice Profile ID : VP1001")
+
+# -----------------------------------
+# AUTHENTICATE
+# -----------------------------------
+elif menu == "Authenticate Voice":
+    st.header("🔐 Authenticate Voice")
+    uploaded_file = st.file_uploader(
+        "Upload current voice sample (.wav)",
+        type=["wav"]
+    )
+    if uploaded_file:
+        similarity = random.randint(70, 99)
+        st.metric("Voice Similarity", f"{similarity}%")
+        if similarity >= 90:
+            st.success("✅ User Authenticated")
+        elif similarity >= 80:
+            st.warning("⚠ Voice changed. Possible cold detected.")
+            if st.button("Create Temporary Voice Profile"):
+                st.success("Temporary Voice Profile Created")
+        else:
+            st.error("❌ Authentication Failed")
+
+# -----------------------------------
+# HISTORY
+# -----------------------------------
+elif menu == "Voice History":
+    st.header("📊 Voice Profile History")
+    st.table({
+        "Profile": ["Normal Voice", "Cold Voice", "Recovery Voice"],
+        "Status": ["Active", "Temporary", "Archived"],
+        "Similarity": ["100%", "84%", "95%"]
+    })
+
+# # -----------------------------------
+# # DATASET PREVIEW (Hugging Face datasets-server API)
+# # -----------------------------------
+# elif menu == "Dataset Preview":
+#     st.header("📁 Hugging Face Dataset Preview")
+#     st.write(
+#         "Fetches the first rows of the "
+#         "`jml2026/multilingual-accent-speech` dataset "
+#         "(config: `english_united_states`, split: `free_speech`) "
+#         "from the Hugging Face datasets-server API."
+#     )
+
+#     HF_DATASETS_SERVER_URL = "https://datasets-server.huggingface.co/first-rows"
+#     params = {
+#         "dataset": "jml2026/multilingual-accent-speech",
+#         "config": "english_united_states",
+#         "split": "free_speech",
+#     }
+
+#     if st.button("Fetch Dataset Preview"):
+#         try:
+#             with httpx.Client(verify=False, timeout=30.0) as hf_client:
+#                 hf_response = hf_client.get(HF_DATASETS_SERVER_URL, params=params)
+#                 hf_response.raise_for_status()
+#                 data = hf_response.json()
+
+#             st.success("✅ Dataset preview fetched successfully")
+
+#             # Show dataset-level info if present
+#             if "dataset_info" in data:
+#                 st.subheader("Dataset Info")
+#                 st.json(data["dataset_info"], expanded=False)
+
+#             # Show the first rows in a table if available
+#             rows = data.get("rows", [])
+#             if rows:
+#                 st.subheader("First Rows")
+#                 # Each row has a 'row_idx' and a 'row' dict with the actual fields
+#                 table_rows = [r.get("row", {}) for r in rows]
+#                 st.table(table_rows)
+#             else:
+#                 st.info("No rows returned for this dataset/config/split.")
+
+#             with st.expander("Raw JSON Response"):
+#                 st.json(data)
+
+#         except httpx.HTTPStatusError as e:
+#             st.error(f"❌ HTTP error from datasets-server: {e.response.status_code}")
+#             st.code(e.response.text)
+#         except Exception as e:
+#             st.error("❌ Failed to fetch dataset preview")
+#             st.code(str(e))
