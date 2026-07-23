@@ -1,0 +1,15 @@
+PDF upload
+✅ PDF text extraction using PyMuPDF
+✅ Chunking with page metadata
+✅ ChromaDB vector storage
+✅ Interactive question answering
+✅ Question intent routing
+✅ Citation with source page
+✅ Retrieval-based confidence score
+✅ Input guardrails
+✅ Retrieval threshold guardrail
+✅ Output/citation validation
+✅ Refusal when evidence is insufficient
+✅ Basic forecasting using historical values
+✅ Model-agnostic OpenAI-compatible LLM layer
+✅ Token optimization through limited retrieval and context selection
