@@ -1,0 +1,1126 @@
+PDF text extraction using PyMuPDF
+Chunking with page metadata
+ChromaDB vector storage
+Interactive question answering
+Question intent routing
+Citation with source page
+Retrieval-based confidence score
+Input guardrails
+Retrieval threshold guardrail
+Output/citation validation
+Refusal when evidence is insufficient
+Basic forecasting using historical values
+Token optimization through limited retrieval and context selection
+
+Code with debugger:
+
+import hashlib
+import os
+import re
+import base64
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import chromadb
+import fitz
+import numpy as np
+import streamlit as st
+from chromadb.api.types import EmbeddingFunction
+from openai import OpenAI
+
+
+# This file implements a retrieval-augmented QA app for PDFs with:
+# 1) PyMuPDF extraction, 2) ChromaDB retrieval, 3) confidence/guardrails,
+# 4) intent-based routing (QA vs forecasting), and 5) citation display.
+
+
+@dataclass
+class RetrievalResult:
+    """Structured retrieval payload passed from retriever to answer stage."""
+
+    context: str
+    citations: List[Dict[str, object]]
+    confidence: float
+    hit_count: int
+    rejected: bool
+    rejection_reason: str
+
+
+class OpenAICompatibleLayer:
+    """Model-agnostic wrapper for OpenAI-compatible chat and embeddings endpoints."""
+
+    def __init__(self, base_url: str, api_key: str, chat_model: str, embedding_model: str):
+        # Any provider that supports OpenAI-compatible APIs can be plugged in here.
+        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.chat_model = chat_model
+        self.embedding_model = embedding_model
+
+    def embed(self, texts: List[str]) -> List[List[float]]:
+        """Create embeddings for a list of texts."""
+        cleaned = [t.replace("\n", " ").strip() for t in texts]
+        response = self.client.embeddings.create(model=self.embedding_model, input=cleaned)
+        return [item.embedding for item in response.data]
+
+    def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.1) -> str:
+        """Send one chat completion request and return only the model text."""
+        response = self.client.chat.completions.create(
+            model=self.chat_model,
+            temperature=temperature,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return response.choices[0].message.content or ""
+
+
+class OpenAIEmbeddingFn(EmbeddingFunction):
+    """Adapter so ChromaDB can call our custom embedding layer."""
+
+    def __init__(self, llm_layer: OpenAICompatibleLayer):
+        self.llm_layer = llm_layer
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        return self.llm_layer.embed(list(input))
+
+
+def init_state() -> None:
+    """Initialize Streamlit session state keys used across reruns."""
+
+    defaults = {
+        "collection_name": None,
+        "last_uploaded_sha": None,
+        "chat_history": [],
+        "doc_ready": False,
+        "pdf_b64": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def file_sha256(data: bytes) -> str:
+    """Create deterministic fingerprint so same PDF can be detected on re-upload."""
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
+    """Split long text into overlapping chunks to improve retrieval coverage."""
+
+    if not text:
+        return []
+    chunks = []
+    step = max(1, chunk_size - overlap)
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += step
+    return chunks
+
+
+def extract_pdf_chunks(pdf_bytes: bytes, filename: str) -> Tuple[List[str], List[Dict[str, object]]]:
+    """Extract page text from PDF and attach page/chunk metadata per chunk."""
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    all_texts: List[str] = []
+    all_meta: List[Dict[str, object]] = []
+    try:
+        for page_index in range(doc.page_count):
+            page = doc.load_page(page_index)
+            page_text = page.get_text("text") or ""
+            for chunk_index, chunk in enumerate(chunk_text(page_text), start=1):
+                clean = re.sub(r"\s+", " ", chunk).strip()
+                if not clean:
+                    continue
+                all_texts.append(clean)
+                all_meta.append(
+                    {
+                        "source": filename,
+                        "page": page_index + 1,
+                        "chunk": chunk_index,
+                    }
+                )
+    finally:
+        doc.close()
+    return all_texts, all_meta
+
+
+def make_collection_name(file_hash: str) -> str:
+    """Build a safe, short Chroma collection name from file hash."""
+
+    return f"pdf_{file_hash[:20]}"
+
+
+def contains_blocked_pattern(text: str) -> Optional[str]:
+    """Basic input guardrails for prompt-injection and abusive misuse terms."""
+
+    patterns = {
+        "prompt injection": r"ignore\s+previous\s+instructions|system\s*prompt|developer\s*message",
+        "abuse": r"\b(hack|exploit|malware|phishing|bypass)\b",
+    }
+    lowered = text.lower()
+    for reason, pattern in patterns.items():
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            return reason
+    return None
+
+
+def route_intent(question: str) -> str:
+    """Route query to either normal QA flow or numeric forecasting flow."""
+
+    q = question.lower()
+    forecast_terms = [
+        "forecast",
+        "predict",
+        "projection",
+        "trend",
+        "next",
+        "future",
+        "estimate",
+    ]
+    if any(term in q for term in forecast_terms):
+        return "forecast"
+    return "qa"
+
+
+def build_context_and_confidence(
+    collection,
+    query: str,
+    k: int,
+    distance_threshold: float,
+    max_context_chars: int,
+) -> RetrievalResult:
+    """
+    Retrieve top-k chunks, filter by distance threshold, enforce context budget,
+    and compute confidence from mean distance.
+    """
+
+    result = collection.query(
+        query_texts=[query],
+        n_results=k,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    docs = result.get("documents", [[]])[0]
+    metas = result.get("metadatas", [[]])[0]
+    distances = result.get("distances", [[]])[0]
+
+    if not docs:
+        return RetrievalResult("", [], 0.0, 0, True, "No evidence retrieved.")
+
+    accepted = []
+    for doc_text, meta, dist in zip(docs, metas, distances):
+        if dist is None:
+            continue
+        if dist <= distance_threshold:
+            accepted.append((doc_text, meta, float(dist)))
+
+    if not accepted:
+        return RetrievalResult("", [], 0.0, 0, True, "Retrieved evidence was below quality threshold.")
+
+    accepted.sort(key=lambda x: x[2])
+    context_blocks = []
+    citations: List[Dict[str, object]] = []
+    total_chars = 0
+    dist_values = []
+    for doc_text, meta, dist in accepted:
+        snippet = doc_text[:800]
+        candidate = f"[Page {meta['page']}, Chunk {meta['chunk']}] {snippet}"
+        new_total = total_chars + len(candidate)
+        if new_total > max_context_chars:
+            break
+        context_blocks.append(candidate)
+        citations.append(
+            {
+                "source": meta["source"],
+                "page": int(meta["page"]),
+                "chunk": int(meta["chunk"]),
+                "distance": round(dist, 4),
+                # Snippet acts as a quick locator for where evidence came from.
+                "snippet": snippet[:160],
+            }
+        )
+        dist_values.append(dist)
+        total_chars = new_total
+
+    if not context_blocks:
+        return RetrievalResult("", [], 0.0, 0, True, "Context budget too small to include evidence.")
+
+    avg_dist = float(np.mean(dist_values)) if dist_values else 1.0
+    confidence = max(0.0, min(1.0, 1.0 - avg_dist))
+    unique_citations = []
+    seen = set()
+    for citation in citations:
+        # De-duplicate by exact source/page/chunk location.
+        key = (citation["source"], citation["page"], citation["chunk"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_citations.append(citation)
+    return RetrievalResult(
+        context="\n\n".join(context_blocks),
+        citations=unique_citations,
+        confidence=confidence,
+        hit_count=len(context_blocks),
+        rejected=False,
+        rejection_reason="",
+    )
+
+
+def extract_historical_values(text: str) -> List[float]:
+    """Extract ordered numeric values from retrieved context for forecasting."""
+
+    values = re.findall(r"(?<!\w)(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?(?!\w)", text)
+    parsed = []
+    for value in values:
+        try:
+            parsed.append(float(value.replace(",", "")))
+        except ValueError:
+            continue
+    return parsed
+
+
+def basic_linear_forecast(series: List[float], steps: int = 3) -> List[float]:
+    """Simple trend forecast using linear regression (numpy polyfit)."""
+
+    if len(series) < 3:
+        return []
+    x = np.arange(len(series), dtype=float)
+    y = np.array(series, dtype=float)
+    m, b = np.polyfit(x, y, 1)
+    future_x = np.arange(len(series), len(series) + steps, dtype=float)
+    preds = (m * future_x + b).tolist()
+    return [round(v, 3) for v in preds]
+
+
+def validate_output(answer: str, citations: List[Dict[str, object]]) -> Tuple[bool, str]:
+    """Validate non-empty output and check that mentioned pages exist in retrieved citations."""
+
+    if not answer.strip():
+        return False, "Model returned an empty answer."
+    if not citations:
+        return False, "No citations available for validation."
+
+    # If model references explicit page numbers, ensure they were in retrieval evidence.
+    pages_in_answer = set(re.findall(r"[Pp]age\s+(\d+)", answer))
+    cited_pages = set()
+    for citation in citations:
+        page = citation.get("page")
+        if page is not None:
+            cited_pages.add(str(page))
+
+    if pages_in_answer and not pages_in_answer.issubset(cited_pages):
+        return False, "Answer cited page numbers that were not in retrieved evidence."
+
+    return True, ""
+
+
+def refusal_message(reason: str) -> str:
+    """Consistent refusal string when evidence or validation fails."""
+
+    return (
+        "I cannot answer reliably from the uploaded document. "
+        f"Reason: {reason} "
+        "Please ask a question closer to the document text or upload a more relevant PDF."
+    )
+
+
+def build_pdf_page_link(pdf_b64: Optional[str], page: int) -> Optional[str]:
+    """Create a browser-openable PDF link that jumps to a specific page when possible."""
+
+    if not pdf_b64:
+        return None
+    safe_page = max(1, int(page))
+    return f"data:application/pdf;base64,{pdf_b64}#page={safe_page}"
+
+
+def render_response_cards(intent: str, confidence: float, chunks: int, citations: List[Dict[str, object]]) -> None:
+    """Render confidence and citations in a simplified UI."""
+
+    confidence_100 = round(confidence * 100)
+    st.metric("Confidence", f"{confidence_100}")
+    st.caption("Confidence guide: Good >= 80 | Medium 60-79 | Low < 60")
+
+    if citations:
+        st.markdown("**Citations**")
+        pdf_b64 = st.session_state.get("pdf_b64")
+        for idx, citation in enumerate(citations, start=1):
+            source = citation.get("source", "unknown")
+            page = citation.get("page", "?")
+            snippet = citation.get("snippet", "")
+            st.info(
+                f"[{idx}] {source} | Page {page}\n\n"
+                f"Preview: {snippet}..."
+            )
+
+            # Link opens embedded PDF and jumps to cited page (browser support dependent).
+            if isinstance(page, int):
+                page_link = build_pdf_page_link(pdf_b64, page)
+                if page_link:
+                    st.markdown(f"[View Page {page}]({page_link})")
+
+
+def render_debug_panel(debug: Dict[str, object]) -> None:
+    """Show retrieval internals in an expandable panel for demo transparency."""
+
+    with st.expander("Retrieval Debug", expanded=False):
+        st.json(debug)
+
+
+# -----------------------------
+# Streamlit UI and main app flow
+# -----------------------------
+st.set_page_config(page_title="PDF QA + Forecasting", layout="wide")
+st.title("PDF QA Assistant with Guardrails")
+st.caption("PyMuPDF + ChromaDB + OpenAI-compatible LLM")
+
+init_state()
+
+with st.sidebar:
+    st.subheader("Model Settings")
+    base_url = st.text_input("OpenAI-compatible Base URL", value=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    api_key = st.text_input("API Key", value=os.getenv("OPENAI_API_KEY", ""), type="password")
+    chat_model = st.text_input("Chat Model", value=os.getenv("CHAT_MODEL", "gpt-4o-mini"))
+    embedding_model = st.text_input("Embedding Model", value=os.getenv("EMBED_MODEL", "text-embedding-3-small"))
+
+    st.subheader("Retrieval Settings")
+    # Tuned defaults: a slightly wider recall window while still filtering weak matches.
+    top_k = st.slider("Top-K Chunks", min_value=2, max_value=8, value=5)
+    threshold = st.slider("Distance Threshold (lower is stricter)", min_value=0.1, max_value=2.0, value=1.25, step=0.05)
+    max_context_chars = st.slider("Max Context Characters", min_value=1000, max_value=7000, value=3600, step=200)
+
+if not api_key.strip():
+    st.warning("Enter an API key in the sidebar to continue.")
+    st.stop()
+
+llm_layer = OpenAICompatibleLayer(
+    base_url=base_url.strip(),
+    api_key=api_key.strip(),
+    chat_model=chat_model.strip(),
+    embedding_model=embedding_model.strip(),
+)
+
+uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
+
+if uploaded_file is not None:
+    # Re-index only when file content changes.
+    pdf_bytes = uploaded_file.read()
+    sha = file_sha256(pdf_bytes)
+
+    if st.session_state.last_uploaded_sha != sha:
+        with st.spinner("Extracting text with PyMuPDF and indexing in ChromaDB..."):
+            texts, metas = extract_pdf_chunks(pdf_bytes, uploaded_file.name)
+            if not texts:
+                st.error("No extractable text found in this PDF.")
+                st.stop()
+
+            client = chromadb.PersistentClient(path="chroma_store")
+            collection_name = make_collection_name(sha)
+
+            existing = [c.name for c in client.list_collections()]
+            if collection_name in existing:
+                # Replace previous index for same document hash.
+                client.delete_collection(name=collection_name)
+
+            collection = client.create_collection(
+                name=collection_name,
+                embedding_function=OpenAIEmbeddingFn(llm_layer),
+                metadata={"hnsw:space": "cosine"},
+            )
+
+            ids = [f"{collection_name}_{i}" for i in range(len(texts))]
+            collection.add(documents=texts, metadatas=metas, ids=ids)
+
+            st.session_state.collection_name = collection_name
+            st.session_state.last_uploaded_sha = sha
+            st.session_state.doc_ready = True
+            st.session_state.chat_history = []
+            # Store PDF in-memory as base64 for page-jump citation links.
+            st.session_state.pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+
+        st.success(f"Indexed {len(texts)} chunks from {uploaded_file.name}.")
+
+if st.session_state.doc_ready and st.session_state.collection_name:
+    chroma_client = chromadb.PersistentClient(path="chroma_store")
+    collection = chroma_client.get_collection(
+        name=st.session_state.collection_name,
+        embedding_function=OpenAIEmbeddingFn(llm_layer),
+    )
+
+    st.subheader("Interactive Q&A")
+    for item in st.session_state.chat_history:
+        st.markdown(f"You: {item['q']}")
+        st.markdown(f"Assistant: {item['a']}")
+        render_response_cards(
+            intent=item["intent"],
+            confidence=item["confidence"],
+            chunks=item["chunks"],
+            citations=item["citations"],
+        )
+        render_debug_panel(item["debug"])
+        st.divider()
+
+    # One-click prompt starters help run a fast hackathon demo.
+    st.markdown("**Sample questions**")
+    sample_cols = st.columns(3)
+    sample_q = None
+    if sample_cols[0].button("Summarize key findings"):
+        sample_q = "Summarize the key findings from this PDF in simple language."
+    if sample_cols[1].button("List important warnings"):
+        sample_q = "What warning signs or important cautions are mentioned?"
+    if sample_cols[2].button("Forecast trend from numbers"):
+        sample_q = "Forecast the next 3 values from the historical numbers in this document."
+
+    question = st.text_input("Ask a question about the uploaded PDF")
+    ask = st.button("Ask")
+
+    if ask or sample_q:
+        raw_question = (sample_q or question or "").strip()
+
+        # Input guardrails
+        if not raw_question:
+            st.warning("Please enter a question.")
+            st.stop()
+        if len(raw_question) > 1200:
+            st.warning("Question too long. Please keep it under 1200 characters.")
+            st.stop()
+        blocked_reason = contains_blocked_pattern(raw_question)
+        if blocked_reason:
+            st.warning(f"Question blocked by input guardrails: {blocked_reason}.")
+            st.stop()
+
+        intent = route_intent(raw_question)
+
+        # Retrieve context + confidence from vector store.
+        retrieval = build_context_and_confidence(
+            collection=collection,
+            query=raw_question,
+            k=top_k,
+            distance_threshold=threshold,
+            max_context_chars=max_context_chars,
+        )
+
+        # Retrieval threshold guardrail and refusal behavior
+        if retrieval.rejected:
+            answer = refusal_message(retrieval.rejection_reason)
+            confidence = 0.0
+            chunks = 0
+            citations = []
+        else:
+            if intent == "forecast":
+                # Forecast path: derive a numeric series from retrieved evidence.
+                history = extract_historical_values(retrieval.context)
+                preds = basic_linear_forecast(history, steps=3)
+                if not preds:
+                    answer = refusal_message(
+                        "Forecasting requires at least 3 historical numeric values in retrieved evidence."
+                    )
+                else:
+                    answer = (
+                        "Forecast generated from retrieved historical values.\n"
+                        f"Recent values used (sample): {history[:10]}\n"
+                        f"Next 3 projected values: {preds}"
+                    )
+            else:
+                # QA path: LLM answers strictly from retrieved context.
+                system_prompt = (
+                    "You are a precise assistant. Use ONLY the provided context. "
+                    "If evidence is insufficient, say exactly: INSUFFICIENT_EVIDENCE. "
+                    "Keep answer concise and factual."
+                )
+                user_prompt = (
+                    f"Question:\n{raw_question}\n\n"
+                    f"Context:\n{retrieval.context}\n\n"
+                    "Answer in 3-8 lines."
+                )
+                answer = llm_layer.chat(system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.0)
+
+                if "INSUFFICIENT_EVIDENCE" in answer.upper():
+                    answer = refusal_message("Model could not find sufficient evidence in retrieved context.")
+
+            # Output/citation validation
+            valid, validation_reason = validate_output(answer, retrieval.citations)
+            if not valid:
+                answer = refusal_message(validation_reason)
+
+            confidence = retrieval.confidence
+            chunks = retrieval.hit_count
+            citations = retrieval.citations
+
+        debug = {
+            "question": raw_question,
+            "intent": intent,
+            "top_k": top_k,
+            "distance_threshold": threshold,
+            "max_context_chars": max_context_chars,
+            "retrieval_rejected": retrieval.rejected,
+            "rejection_reason": retrieval.rejection_reason,
+            "confidence": round(confidence * 100),
+            "citations_count": len(citations),
+            "citation_pages": [c.get("page") for c in citations],
+        }
+
+        st.session_state.chat_history.append(
+            {
+                "q": raw_question,
+                "a": answer,
+                "intent": intent,
+                "confidence": confidence,
+                "chunks": chunks,
+                "citations": citations,
+                "debug": debug,
+            }
+        )
+        # Rerun so newly appended answer renders at top with cards.
+        st.rerun()
+
+st.caption("Responses are retrieval-grounded and include guardrails; verify critical decisions with original sources.")
+
+********************************************************************************************************
+
+Code without Retrieval Debug
+
+import hashlib
+import os
+import re
+import base64
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import chromadb
+import fitz
+import numpy as np
+import streamlit as st
+from chromadb.api.types import EmbeddingFunction
+from openai import OpenAI
+
+
+# This file implements a retrieval-augmented QA app for PDFs with:
+# 1) PyMuPDF extraction, 2) ChromaDB retrieval, 3) confidence/guardrails,
+# 4) intent-based routing (QA vs forecasting), and 5) citation display.
+
+
+@dataclass
+class RetrievalResult:
+    """Structured retrieval payload passed from retriever to answer stage."""
+
+    context: str
+    citations: List[Dict[str, object]]
+    confidence: float
+    hit_count: int
+    rejected: bool
+    rejection_reason: str
+
+
+class OpenAICompatibleLayer:
+    """Model-agnostic wrapper for OpenAI-compatible chat and embeddings endpoints."""
+
+    def __init__(self, base_url: str, api_key: str, chat_model: str, embedding_model: str):
+        # Any provider that supports OpenAI-compatible APIs can be plugged in here.
+        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.chat_model = chat_model
+        self.embedding_model = embedding_model
+
+    def embed(self, texts: List[str]) -> List[List[float]]:
+        """Create embeddings for a list of texts."""
+        cleaned = [t.replace("\n", " ").strip() for t in texts]
+        response = self.client.embeddings.create(model=self.embedding_model, input=cleaned)
+        return [item.embedding for item in response.data]
+
+    def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.1) -> str:
+        """Send one chat completion request and return only the model text."""
+        response = self.client.chat.completions.create(
+            model=self.chat_model,
+            temperature=temperature,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return response.choices[0].message.content or ""
+
+
+class OpenAIEmbeddingFn(EmbeddingFunction):
+    """Adapter so ChromaDB can call our custom embedding layer."""
+
+    def __init__(self, llm_layer: OpenAICompatibleLayer):
+        self.llm_layer = llm_layer
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        return self.llm_layer.embed(list(input))
+
+
+def init_state() -> None:
+    """Initialize Streamlit session state keys used across reruns."""
+
+    defaults = {
+        "collection_name": None,
+        "last_uploaded_sha": None,
+        "chat_history": [],
+        "doc_ready": False,
+        "pdf_b64": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def file_sha256(data: bytes) -> str:
+    """Create deterministic fingerprint so same PDF can be detected on re-upload."""
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
+    """Split long text into overlapping chunks to improve retrieval coverage."""
+
+    if not text:
+        return []
+    chunks = []
+    step = max(1, chunk_size - overlap)
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += step
+    return chunks
+
+
+def extract_pdf_chunks(pdf_bytes: bytes, filename: str) -> Tuple[List[str], List[Dict[str, object]]]:
+    """Extract page text from PDF and attach page/chunk metadata per chunk."""
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    all_texts: List[str] = []
+    all_meta: List[Dict[str, object]] = []
+    try:
+        for page_index in range(doc.page_count):
+            page = doc.load_page(page_index)
+            page_text = page.get_text("text") or ""
+            for chunk_index, chunk in enumerate(chunk_text(page_text), start=1):
+                clean = re.sub(r"\s+", " ", chunk).strip()
+                if not clean:
+                    continue
+                all_texts.append(clean)
+                all_meta.append(
+                    {
+                        "source": filename,
+                        "page": page_index + 1,
+                        "chunk": chunk_index,
+                    }
+                )
+    finally:
+        doc.close()
+    return all_texts, all_meta
+
+
+def make_collection_name(file_hash: str) -> str:
+    """Build a safe, short Chroma collection name from file hash."""
+
+    return f"pdf_{file_hash[:20]}"
+
+
+def contains_blocked_pattern(text: str) -> Optional[str]:
+    """Basic input guardrails for prompt-injection and abusive misuse terms."""
+
+    patterns = {
+        "prompt injection": r"ignore\s+previous\s+instructions|system\s*prompt|developer\s*message",
+        "abuse": r"\b(hack|exploit|malware|phishing|bypass)\b",
+    }
+    lowered = text.lower()
+    for reason, pattern in patterns.items():
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            return reason
+    return None
+
+
+def route_intent(question: str) -> str:
+    """Route query to either normal QA flow or numeric forecasting flow."""
+
+    q = question.lower()
+    forecast_terms = [
+        "forecast",
+        "predict",
+        "projection",
+        "trend",
+        "next",
+        "future",
+        "estimate",
+    ]
+    if any(term in q for term in forecast_terms):
+        return "forecast"
+    return "qa"
+
+
+def build_context_and_confidence(
+    collection,
+    query: str,
+    k: int,
+    distance_threshold: float,
+    max_context_chars: int,
+) -> RetrievalResult:
+    """
+    Retrieve top-k chunks, filter by distance threshold, enforce context budget,
+    and compute confidence from mean distance.
+    """
+
+    result = collection.query(
+        query_texts=[query],
+        n_results=k,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    docs = result.get("documents", [[]])[0]
+    metas = result.get("metadatas", [[]])[0]
+    distances = result.get("distances", [[]])[0]
+
+    if not docs:
+        return RetrievalResult("", [], 0.0, 0, True, "No evidence retrieved.")
+
+    accepted = []
+    for doc_text, meta, dist in zip(docs, metas, distances):
+        if dist is None:
+            continue
+        if dist <= distance_threshold:
+            accepted.append((doc_text, meta, float(dist)))
+
+    if not accepted:
+        return RetrievalResult("", [], 0.0, 0, True, "Retrieved evidence was below quality threshold.")
+
+    accepted.sort(key=lambda x: x[2])
+    context_blocks = []
+    citations: List[Dict[str, object]] = []
+    total_chars = 0
+    dist_values = []
+    for doc_text, meta, dist in accepted:
+        snippet = doc_text[:800]
+        candidate = f"[Page {meta['page']}, Chunk {meta['chunk']}] {snippet}"
+        new_total = total_chars + len(candidate)
+        if new_total > max_context_chars:
+            break
+        context_blocks.append(candidate)
+        citations.append(
+            {
+                "source": meta["source"],
+                "page": int(meta["page"]),
+                "chunk": int(meta["chunk"]),
+                "distance": round(dist, 4),
+                # Snippet acts as a quick locator for where evidence came from.
+                "snippet": snippet[:160],
+            }
+        )
+        dist_values.append(dist)
+        total_chars = new_total
+
+    if not context_blocks:
+        return RetrievalResult("", [], 0.0, 0, True, "Context budget too small to include evidence.")
+
+    avg_dist = float(np.mean(dist_values)) if dist_values else 1.0
+    confidence = max(0.0, min(1.0, 1.0 - avg_dist))
+    unique_citations = []
+    seen = set()
+    for citation in citations:
+        # De-duplicate by exact source/page/chunk location.
+        key = (citation["source"], citation["page"], citation["chunk"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_citations.append(citation)
+    return RetrievalResult(
+        context="\n\n".join(context_blocks),
+        citations=unique_citations,
+        confidence=confidence,
+        hit_count=len(context_blocks),
+        rejected=False,
+        rejection_reason="",
+    )
+
+
+def extract_historical_values(text: str) -> List[float]:
+    """Extract ordered numeric values from retrieved context for forecasting."""
+
+    values = re.findall(r"(?<!\w)(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?(?!\w)", text)
+    parsed = []
+    for value in values:
+        try:
+            parsed.append(float(value.replace(",", "")))
+        except ValueError:
+            continue
+    return parsed
+
+
+def basic_linear_forecast(series: List[float], steps: int = 3) -> List[float]:
+    """Simple trend forecast using linear regression (numpy polyfit)."""
+
+    if len(series) < 3:
+        return []
+    x = np.arange(len(series), dtype=float)
+    y = np.array(series, dtype=float)
+    m, b = np.polyfit(x, y, 1)
+    future_x = np.arange(len(series), len(series) + steps, dtype=float)
+    preds = (m * future_x + b).tolist()
+    return [round(v, 3) for v in preds]
+
+
+def validate_output(answer: str, citations: List[Dict[str, object]]) -> Tuple[bool, str]:
+    """Validate non-empty output and check that mentioned pages exist in retrieved citations."""
+
+    if not answer.strip():
+        return False, "Model returned an empty answer."
+    if not citations:
+        return False, "No citations available for validation."
+
+    # If model references explicit page numbers, ensure they were in retrieval evidence.
+    pages_in_answer = set(re.findall(r"[Pp]age\s+(\d+)", answer))
+    cited_pages = set()
+    for citation in citations:
+        page = citation.get("page")
+        if page is not None:
+            cited_pages.add(str(page))
+
+    if pages_in_answer and not pages_in_answer.issubset(cited_pages):
+        return False, "Answer cited page numbers that were not in retrieved evidence."
+
+    return True, ""
+
+
+def refusal_message(reason: str) -> str:
+    """Consistent refusal string when evidence or validation fails."""
+
+    return (
+        "I cannot answer reliably from the uploaded document. "
+        f"Reason: {reason} "
+        "Please ask a question closer to the document text or upload a more relevant PDF."
+    )
+
+
+def build_pdf_page_link(pdf_b64: Optional[str], page: int) -> Optional[str]:
+    """Create a browser-openable PDF link that jumps to a specific page when possible."""
+
+    if not pdf_b64:
+        return None
+    safe_page = max(1, int(page))
+    return f"data:application/pdf;base64,{pdf_b64}#page={safe_page}"
+
+
+def render_response_cards(intent: str, confidence: float, chunks: int, citations: List[Dict[str, object]]) -> None:
+    """Render confidence and citations in a simplified UI."""
+
+    confidence_100 = round(confidence * 100)
+    st.metric("Confidence", f"{confidence_100}")
+    st.caption("Confidence guide: Good >= 80 | Medium 60-79 | Low < 60")
+
+    if citations:
+        st.markdown("**Citations**")
+        pdf_b64 = st.session_state.get("pdf_b64")
+        for idx, citation in enumerate(citations, start=1):
+            source = citation.get("source", "unknown")
+            page = citation.get("page", "?")
+            snippet = citation.get("snippet", "")
+            st.info(
+                f"[{idx}] {source} | Page {page}\n\n"
+                f"Preview: {snippet}..."
+            )
+
+            # Link opens embedded PDF and jumps to cited page (browser support dependent).
+            if isinstance(page, int):
+                page_link = build_pdf_page_link(pdf_b64, page)
+                if page_link:
+                    st.markdown(f"[View Page {page}]({page_link})")
+
+
+# -----------------------------
+# Streamlit UI and main app flow
+# -----------------------------
+st.set_page_config(page_title="PDF QA + Forecasting", layout="wide")
+st.title("PDF QA Assistant with Guardrails")
+st.caption("PyMuPDF + ChromaDB + OpenAI-compatible LLM")
+
+init_state()
+
+with st.sidebar:
+    st.subheader("Model Settings")
+    base_url = st.text_input("OpenAI-compatible Base URL", value=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    api_key = st.text_input("API Key", value=os.getenv("OPENAI_API_KEY", ""), type="password")
+    chat_model = st.text_input("Chat Model", value=os.getenv("CHAT_MODEL", "gpt-4o-mini"))
+    embedding_model = st.text_input("Embedding Model", value=os.getenv("EMBED_MODEL", "text-embedding-3-small"))
+
+    st.subheader("Retrieval Settings")
+    # Tuned defaults: a slightly wider recall window while still filtering weak matches.
+    top_k = st.slider("Top-K Chunks", min_value=2, max_value=8, value=5)
+    threshold = st.slider("Distance Threshold (lower is stricter)", min_value=0.1, max_value=2.0, value=1.25, step=0.05)
+    max_context_chars = st.slider("Max Context Characters", min_value=1000, max_value=7000, value=3600, step=200)
+
+if not api_key.strip():
+    st.warning("Enter an API key in the sidebar to continue.")
+    st.stop()
+
+llm_layer = OpenAICompatibleLayer(
+    base_url=base_url.strip(),
+    api_key=api_key.strip(),
+    chat_model=chat_model.strip(),
+    embedding_model=embedding_model.strip(),
+)
+
+uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
+
+if uploaded_file is not None:
+    # Re-index only when file content changes.
+    pdf_bytes = uploaded_file.read()
+    sha = file_sha256(pdf_bytes)
+
+    if st.session_state.last_uploaded_sha != sha:
+        with st.spinner("Extracting text with PyMuPDF and indexing in ChromaDB..."):
+            texts, metas = extract_pdf_chunks(pdf_bytes, uploaded_file.name)
+            if not texts:
+                st.error("No extractable text found in this PDF.")
+                st.stop()
+
+            client = chromadb.PersistentClient(path="chroma_store")
+            collection_name = make_collection_name(sha)
+
+            existing = [c.name for c in client.list_collections()]
+            if collection_name in existing:
+                # Replace previous index for same document hash.
+                client.delete_collection(name=collection_name)
+
+            collection = client.create_collection(
+                name=collection_name,
+                embedding_function=OpenAIEmbeddingFn(llm_layer),
+                metadata={"hnsw:space": "cosine"},
+            )
+
+            ids = [f"{collection_name}_{i}" for i in range(len(texts))]
+            collection.add(documents=texts, metadatas=metas, ids=ids)
+
+            st.session_state.collection_name = collection_name
+            st.session_state.last_uploaded_sha = sha
+            st.session_state.doc_ready = True
+            st.session_state.chat_history = []
+            # Store PDF in-memory as base64 for page-jump citation links.
+            st.session_state.pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+
+        st.success(f"Indexed {len(texts)} chunks from {uploaded_file.name}.")
+
+if st.session_state.doc_ready and st.session_state.collection_name:
+    chroma_client = chromadb.PersistentClient(path="chroma_store")
+    collection = chroma_client.get_collection(
+        name=st.session_state.collection_name,
+        embedding_function=OpenAIEmbeddingFn(llm_layer),
+    )
+
+    st.subheader("Interactive Q&A")
+    for item in st.session_state.chat_history:
+        st.markdown(f"You: {item['q']}")
+        st.markdown(f"Assistant: {item['a']}")
+        render_response_cards(
+            intent=item["intent"],
+            confidence=item["confidence"],
+            chunks=item["chunks"],
+            citations=item["citations"],
+        )
+        st.divider()
+
+    # One-click prompt starters help run a fast hackathon demo.
+    st.markdown("**Sample questions**")
+    sample_cols = st.columns(3)
+    sample_q = None
+    if sample_cols[0].button("Summarize key findings"):
+        sample_q = "Summarize the key findings from this PDF in simple language."
+    if sample_cols[1].button("List important warnings"):
+        sample_q = "What warning signs or important cautions are mentioned?"
+    if sample_cols[2].button("Forecast trend from numbers"):
+        sample_q = "Forecast the next 3 values from the historical numbers in this document."
+
+    question = st.text_input("Ask a question about the uploaded PDF")
+    ask = st.button("Ask")
+
+    if ask or sample_q:
+        raw_question = (sample_q or question or "").strip()
+
+        # Input guardrails
+        if not raw_question:
+            st.warning("Please enter a question.")
+            st.stop()
+        if len(raw_question) > 1200:
+            st.warning("Question too long. Please keep it under 1200 characters.")
+            st.stop()
+        blocked_reason = contains_blocked_pattern(raw_question)
+        if blocked_reason:
+            st.warning(f"Question blocked by input guardrails: {blocked_reason}.")
+            st.stop()
+
+        intent = route_intent(raw_question)
+
+        # Retrieve context + confidence from vector store.
+        retrieval = build_context_and_confidence(
+            collection=collection,
+            query=raw_question,
+            k=top_k,
+            distance_threshold=threshold,
+            max_context_chars=max_context_chars,
+        )
+
+        # Retrieval threshold guardrail and refusal behavior
+        if retrieval.rejected:
+            answer = refusal_message(retrieval.rejection_reason)
+            confidence = 0.0
+            chunks = 0
+            citations = []
+        else:
+            if intent == "forecast":
+                # Forecast path: derive a numeric series from retrieved evidence.
+                history = extract_historical_values(retrieval.context)
+                preds = basic_linear_forecast(history, steps=3)
+                if not preds:
+                    answer = refusal_message(
+                        "Forecasting requires at least 3 historical numeric values in retrieved evidence."
+                    )
+                else:
+                    answer = (
+                        "Forecast generated from retrieved historical values.\n"
+                        f"Recent values used (sample): {history[:10]}\n"
+                        f"Next 3 projected values: {preds}"
+                    )
+            else:
+                # QA path: LLM answers strictly from retrieved context.
+                system_prompt = (
+                    "You are a precise assistant. Use ONLY the provided context. "
+                    "If evidence is insufficient, say exactly: INSUFFICIENT_EVIDENCE. "
+                    "Keep answer concise and factual."
+                )
+                user_prompt = (
+                    f"Question:\n{raw_question}\n\n"
+                    f"Context:\n{retrieval.context}\n\n"
+                    "Answer in 3-8 lines."
+                )
+                answer = llm_layer.chat(system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.0)
+
+                if "INSUFFICIENT_EVIDENCE" in answer.upper():
+                    answer = refusal_message("Model could not find sufficient evidence in retrieved context.")
+
+            # Output/citation validation
+            valid, validation_reason = validate_output(answer, retrieval.citations)
+            if not valid:
+                answer = refusal_message(validation_reason)
+
+            confidence = retrieval.confidence
+            chunks = retrieval.hit_count
+            citations = retrieval.citations
+
+        st.session_state.chat_history.append(
+            {
+                "q": raw_question,
+                "a": answer,
+                "intent": intent,
+                "confidence": confidence,
+                "chunks": chunks,
+                "citations": citations,
+            }
+        )
+        # Rerun so newly appended answer renders at top with cards.
+        st.rerun()
+
+st.caption("Responses are retrieval-grounded and include guardrails; verify critical decisions with original sources.")
+
