@@ -1,0 +1,99 @@
+Your Architecture
+
+High-level flow:
+
+User uploads PDF in Streamlit UI
+PDF text extraction with PyMuPDF page by page
+Text chunking with overlap
+Chunks embedded via OpenAI-compatible embedding API
+Stored in ChromaDB with metadata: source, page, chunk
+User asks a question (manual or suggested follow-up)
+Input guardrails run first
+Intent routing decides QA or Forecast path
+Retriever fetches top-k chunks and filters by threshold
+Context budget applied to control token usage
+QA path: LLM answers only from retrieved context
+Forecast path: numeric extraction + linear trend projection
+Output validation checks evidence/citation consistency
+Confidence score shown as whole number
+Citation cards shown with page, preview, and View Page link
+Simple architecture statement for jury:
+UI layer (Streamlit) + Retrieval layer (ChromaDB) + Reasoning layer (LLM/forecast) + Trust layer (guardrails, validation, refusal, citations).
+
+
+Every response is evidence-first, confidence-scored, source-linked, and safely refused when evidence is weak.
+
+Expected Jury Questions 
+
+What problem are you solving better than plain chatbot QA?
+Plain chatbot QA gives fluent answers but weak traceability. My app is document-grounded: it retrieves evidence from the uploaded PDF, shows confidence, cites source pages, and refuses when evidence is weak.
+
+Why did you choose PyMuPDF over other extractors?
+PyMuPDF is fast, stable, and good for page-wise extraction with low overhead. It gives me reliable page boundaries, which are essential for citations and View Page links.
+
+How do you prevent hallucinations?
+Multiple controls: retrieval-first context, strict prompt to use only context, threshold filtering, output/citation validation, and refusal when evidence is insufficient.
+
+How does your confidence score work?
+It is retrieval confidence, not model certainty. I compute mean vector distance of accepted chunks and transform it into a 0-100 score for interpretability.
+
+What does your retrieval threshold guardrail do?
+After top-k retrieval, it drops chunks with weak similarity (distance above threshold). If no chunks pass, the system refuses instead of guessing.
+
+What happens when evidence is weak or missing?
+The app returns a refusal message with reason, confidence goes low/zero, and no fabricated answer is shown.
+
+How are citations generated and validated?
+Each chunk is stored with metadata (source, page, chunk). Retrieved chunks become citations. Validation checks page references in answer against retrieved citation pages.
+
+Can user verify source directly?
+Yes. Each citation has View Page N link and a text preview snippet so users can verify evidence quickly.
+
+Why ChromaDB, and how are chunks indexed?
+ChromaDB is lightweight, local-first, and easy for hackathon deployment. Chunks are embedded and indexed with IDs plus metadata for page-level traceability.
+
+
+We built a trustworthy PDF intelligence assistant for domain documents.
+The core problem with plain chatbots is they can sound right without proving source. Our system fixes that by grounding every answer in retrieved evidence from the uploaded PDF.
+
+Flow is simple: user uploads a PDF, we extract text page-wise with PyMuPDF, split into chunks, create embeddings, and store them in ChromaDB with metadata like page and chunk number.
+When a user asks a question, we run guardrails first, then retrieve top relevant chunks with similarity threshold filtering. Only strong evidence is passed to the model. If evidence is weak, we refuse instead of hallucinating.
+
+For explainability, every answer shows a confidence score out of 100, citation previews, and a View Page link so users can jump to source pages directly.
+We also support intent routing: normal factual QA and a lightweight forecasting mode for trend-like questions using historical numeric values from retrieved evidence.
+
+Technically, it is model-agnostic through an OpenAI-compatible client wrapper, so backend models can be swapped easily.
+In short, this is not just a chatbot; it is a retrieval-grounded, guardrailed, verifiable decision-support layer for PDF knowledge.
+
+Why this chunk size and overlap?
+~900 chars with ~150 overlap balances context continuity and retrieval precision. Overlap avoids losing meaning at chunk boundaries.
+
+How do you optimize token usage and cost?
+Top-k cap, threshold filtering, and max context character budget. Only selected evidence is sent to the LLM, not full PDF text.
+
+How does intent routing work between QA and forecasting?
+Keyword-based router sends factual queries to QA path and trend/predict-type queries to forecasting path.
+
+How is forecasting done and limitations?
+It extracts numeric values from retrieved evidence and applies a simple linear trend (polyfit). Limitation: basic heuristic parsing and linear assumption; not domain-grade forecasting.
+
+How do you handle prompt injection or abusive input?
+Input guardrails block suspicious patterns like “ignore previous instructions” and abuse terms before retrieval/LLM call.
+
+How is this model-agnostic?
+I use an OpenAI-compatible wrapper. Change base URL/model/key and it works with any compatible provider.
+
+What are your current limitations?
+No OCR pipeline for scanned PDFs, basic table understanding, simple intent routing, and confidence is retrieval-derived not calibrated probability.
+
+How would you scale to many large PDFs?
+Add multi-document collections, async/background indexing, metadata filters, hybrid retrieval (keyword + vector), caching layers, and incremental re-indexing.
+
+How would you evaluate accuracy objectively?
+Build a gold QA set per document, measure exactness/groundedness, citation correctness, refusal correctness, and track hallucination rate.
+
+What if document has tables/images/scanned pages?
+Current version may miss content in scans/images. Production fix: OCR + layout parsing + table extraction pipeline.
+
+What production improvements would you add next?
+Secrets manager, auth/RBAC, monitoring, structured audit logs, eval dashboards, OCR/table support, and stronger policy guardrails.
